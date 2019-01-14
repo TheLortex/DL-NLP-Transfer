@@ -103,6 +103,9 @@ def get_corpus_location(language, author):
     url, fn = datasets[language][author][0]
     a = urlparse(url)
     file_name = os.path.basename(a.path)
+    if a.fragment != "":
+        file_name = a.fragment
+                    
     path = base_path + file_name
     return standardize(fn(path))
 
@@ -120,6 +123,14 @@ def download(url, target, kaggle):
     else:
         wget.download(url, base_path + file_name)  
 
+def get_datasets(language):
+    output = {}
+    
+    for author in datasets[language].keys():
+        output[author] = get_corpus_location(language, author)
+        
+    return output
+        
 # automated download.
 if __name__ == '__main__':
     files = []
