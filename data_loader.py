@@ -33,7 +33,7 @@ class DataLoader:
 
         self.lengths = [len(sent) for sent in self.sentences]
 
-    def convert_sentence_to_indices(self, sentence):
+    def convert_sentence_to_indices(self, sentence, tensor=True):
         indices = [
                       # assign an integer to each word, if the word is too rare assign unknown token
                       self.word_dict.get(w) if self.word_dict.get(w, VOCAB_SIZE + 1) < VOCAB_SIZE else self.UNK
@@ -45,9 +45,10 @@ class DataLoader:
         indices += [self.EOS] * (self.maxlen - len(indices))
 
         indices = np.array(indices)
-        indices = Variable(torch.from_numpy(indices))
-        if USE_CUDA:
-            indices = indices.cuda(CUDA_DEVICE)
+        if tensor:
+            indices = Variable(torch.from_numpy(indices))
+            if USE_CUDA:
+                indices = indices.cuda(CUDA_DEVICE)
 
         return indices
 
