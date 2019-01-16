@@ -25,23 +25,32 @@ class Encoder(nn.Module):
         inverted_var = var.index_select(0, idx)
         return inverted_var
 
-    def __init__(self):
+    def __init__(self, n_categories=0):
         super().__init__()
+        
+        self.n_categories = n_categories
         self.word2embd = nn.Embedding(VOCAB_SIZE, self.word_size)
-        self.lstm = nn.LSTM(self.word_size, self.thought_size)
+        self.lstm = nn.LSTM(self.word_size + self.n_categories, self.thought_size)
 
-    def forward(self, sentences):
+    def forward(self, sentences, category=None):
+        # category = (n_categories)
         # sentences = (batch_size, maxlen), with padding on the right.
-
         sentences = sentences.transpose(0, 1)  # (maxlen, batch_size)
 
         word_embeddings = F.tanh(self.word2embd(sentences))  # (maxlen, batch_size, word_size)
-
+        maxlen, batch_size, _ = word_embeddings.shape
+        
+        if category is None:
+            full_embeddings = word_embeddings
+        else:
+            category = category.expand((maxlen, batch_size, -1)) # (maxlen, batch_size, n_categories)
+            full_embeddings = torch.cat((word_embeddings, category), 2) # (maxlen, batch_size, word_size + n_categories)
+            
         # The following is a hack: We read embeddings in reverse. This is required to move padding to the left.
         # If reversing is not done then the RNN sees a lot a garbage values right before its final state.
         # This reversing also means that the words will be read in reverse. But this is not a big problem since
         # several sequence to sequence models for Machine Translation do similar hacks.
-        rev = self.reverse_variable(word_embeddings)
+        rev = self.reverse_variable(full_embeddings)
 
         _, (thoughts, _) = self.lstm(rev)
         thoughts = thoughts[-1]  # (batch, thought_size)
@@ -53,18 +62,21 @@ class DuoDecoder(nn.Module):
 
     word_size = Encoder.word_size
 
-    def __init__(self):
+    def __init__(self, n_categories=0):
         super().__init__()
-        self.prev_lstm = nn.LSTM(Encoder.thought_size + self.word_size, self.word_size)
-        self.next_lstm = nn.LSTM(Encoder.thought_size + self.word_size, self.word_size)
+        self.prev_lstm = nn.LSTM(Encoder.thought_size + self.word_size + n_categories, self.word_size)
+        self.next_lstm = nn.LSTM(Encoder.thought_size + self.word_size + n_categories, self.word_size)
         self.worder = nn.Linear(self.word_size, VOCAB_SIZE)
 
-    def forward(self, thoughts, word_embeddings):
+    def forward(self, thoughts, word_embeddings, category=None):
         # thoughts = (batch_size, Encoder.thought_size)
         # word_embeddings = # (maxlen, batch, word_size)
 
         # We need to provide the current sentences's embedding or "thought" at every timestep.
         thoughts = thoughts.repeat(MAXLEN, 1, 1)  # (maxlen, batch, thought_size)
+        
+        _,batch_size,_ = thoughts.shape
+        category = category.expand((MAXLEN, batch_size-1, -1)) # (maxlen, batch_size, n_categories)
 
         # Prepare Thought Vectors for Prev. and Next Decoders.
         prev_thoughts = thoughts[:, :-1, :]  # (maxlen, batch-1, thought_size)
@@ -79,8 +91,12 @@ class DuoDecoder(nn.Module):
         delayed_next_word_embeddings = torch.cat([0 * next_word_embeddings[-1:, :, :], next_word_embeddings[:-1, :, :]])
 
         # Supply current "thought" and delayed word embeddings for teacher forcing.
-        prev_pred_embds, _ = self.prev_lstm(torch.cat([next_thoughts, delayed_prev_word_embeddings], dim=2))  # (maxlen, batch-1, embd_size)
-        next_pred_embds, _ = self.next_lstm(torch.cat([prev_thoughts, delayed_next_word_embeddings], dim=2))  # (maxlen, batch-1, embd_size)
+        if category is None:
+            prev_pred_embds, _ = self.prev_lstm(torch.cat([next_thoughts, delayed_prev_word_embeddings], dim=2))  # (maxlen, batch-1, embd_size)
+            next_pred_embds, _ = self.next_lstm(torch.cat([prev_thoughts, delayed_next_word_embeddings], dim=2))  # (maxlen, batch-1, embd_size)
+        else:
+            prev_pred_embds, _ = self.prev_lstm(torch.cat([next_thoughts, delayed_prev_word_embeddings, category], dim=2))  # (maxlen, batch-1, embd_size)
+            next_pred_embds, _ = self.next_lstm(torch.cat([prev_thoughts, delayed_next_word_embeddings, category], dim=2))  # (maxlen, batch-1, embd_size)
 
         # predict actual words
         a, b, c = prev_pred_embds.size()
@@ -96,10 +112,10 @@ class DuoDecoder(nn.Module):
 
 class UniSkip(nn.Module):
 
-    def __init__(self):
+    def __init__(self, n_categories=0):
         super().__init__()
-        self.encoder = Encoder()
-        self.decoders = DuoDecoder()
+        self.encoder = Encoder(n_categories)
+        self.decoders = DuoDecoder(n_categories)
 
     def create_mask(self, var, lengths):
         mask = var.data.new().resize_as_(var.data).fill_(0)
@@ -114,15 +130,16 @@ class UniSkip(nn.Module):
             
         return mask
 
-    def forward(self, sentences, lengths):
+    def forward(self, sentences, lengths, cat_in=0, cat_out=0):
+        # cat_in = cat_out = (n_categories)
         # sentences = (B, maxlen)
         # lengths = (B)
 
         # Compute Thought Vectors for each sentence. Also get the actual word embeddings for teacher forcing.
-        thoughts, word_embeddings = self.encoder(sentences)  # thoughts = (B, thought_size), word_embeddings = (B, maxlen, word_size)
+        thoughts, word_embeddings = self.encoder(sentences, cat_in)  # thoughts = (B, thought_size), word_embeddings = (B, maxlen, word_size)
 
         # Predict the words for previous and next sentences.
-        prev_pred, next_pred = self.decoders(thoughts, word_embeddings)  # both = (batch-1, maxlen, VOCAB_SIZE)
+        prev_pred, next_pred = self.decoders(thoughts, word_embeddings, cat_out)  # both = (batch-1, maxlen, VOCAB_SIZE)
 
         # mask the predictions, so that loss for beyond-EOS word predictions is cancelled.
         prev_mask = self.create_mask(prev_pred, lengths[:-1])
@@ -140,15 +157,6 @@ class UniSkip(nn.Module):
         _, next_pred_ids = next_pred[0].max(1)
 
         return loss, sentences[0], sentences[1], prev_pred_ids, next_pred_ids
-
-
-
-
-
-
-
-
-
 
 
 
